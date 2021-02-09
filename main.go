@@ -2,67 +2,94 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const base = 5
+const (
+	M = 2
+	N = 8
+)
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*100)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*50)
 	defer cancel()
 
+	result := make([]int, N+1)
 	errCh := make(chan error, 1)
 	var firstSendErr int32
 	wg := new(sync.WaitGroup)
 	done := make(chan struct{}, 1)
+	limit := make(chan struct{}, M)
 
-	for i := 0; i < 10; i++ {
+	for i := 1; i <= N; i++ {
+		limit <- struct{}{}
+		var quit bool
+		select {
+		case <-ctx.Done(): // context已经被cancel，不需要起新的goroutine了
+			quit = true
+		default:
+		}
+		if quit {
+			break
+		}
 		wg.Add(1)
 		go func(x int) {
-			defer wg.Done()
-			if err := doTask(ctx, x+base); err != nil {
+			defer func() {
+				wg.Done()
+				<-limit
+			}()
+			if ret, err := doTask(ctx, x); err != nil {
 				if atomic.CompareAndSwapInt32(&firstSendErr, 0, 1) {
 					errCh <- err
 					cancel() // cancel其他的请求
 				}
+			} else {
+				result[x] = ret
 			}
 		}(i)
 	}
 
 	go func() {
 		wg.Wait()
-		done <- struct{}{}
+		close(done)
 	}()
 
 	select {
 	case err := <-errCh:
-		handleErr(err)
+		handleErr(err, result[1:])
+		<-done
 	case <-done:
 		if len(errCh) > 0 {
 			err := <-errCh
-			handleErr(err)
+			handleErr(err, result[1:])
 			return
 		}
-		fmt.Println("success handle it")
+		fmt.Println("success handle all task:", result[1:])
 	}
-
 }
 
-func handleErr(err error) {
-	fmt.Println("err occurs", err)
+func handleErr(err error, result []int) {
+	fmt.Println("task err occurs: ", err, "result", result)
 }
 
-func doTask(ctx context.Context, i int) (err error) {
-	fmt.Println("task start", i-base)
+func doTask(ctx context.Context, i int) (ret int, err error) {
+	fmt.Println("task start", i)
+	defer func() {
+		fmt.Println("task done", i, "err", err)
+	}()
 	select {
-	case <-time.After(time.Second * time.Duration(i)):
-	case <-ctx.Done():
-		fmt.Println("task canceled", i-base)
-		return ctx.Err()
+	case <-time.After(time.Second * time.Duration(i)): // 模拟处理任务时间
+	case <-ctx.Done(): // 处理任务要支持被context cancel，不然就一直等到处理完再返回了。
+		fmt.Println("task canceled", i)
+		return -1, ctx.Err()
 	}
-	fmt.Println("task done", i-base)
-	return nil
+	if i == 6 { // 模拟出现错误
+		return -1, errors.New("err test")
+	}
+
+	return i, nil
 }
